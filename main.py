@@ -1,6 +1,6 @@
 """
 스킨이데아 글로벌 검색 트렌드 API
-- Google Trends (pytrends) 기반
+- Google Trends (pytrends) + ScraperAPI 프록시 기반
 - 일본: geo=JP, 중국: geo=CN 지역 필터
 - 전 권역 지원
 """
@@ -24,6 +24,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ─── ScraperAPI 설정 ───
+SCRAPER_API_KEY = "223732df48034ed0a69ce58fe24e526e"
+SCRAPER_PROXY   = f"http://scraperapi:{SCRAPER_API_KEY}@proxy-server.scraperapi.com:8001"
 
 REGION_GEO = {
     "global":"","north_america":"US","central_america":"MX",
@@ -50,34 +54,27 @@ def get_geo(region: str, country: Optional[str]) -> str:
         return COUNTRY_GEO[country]
     return REGION_GEO.get(region, "")
 
-def build_session():
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Referer": "https://trends.google.com/",
-    })
-    session.mount("https://", HTTPAdapter(max_retries=2))
-    return session
-
 def safe_trends_request(keywords: list, timeframe: str, geo: str, retries: int = 3):
     last_error = None
     for attempt in range(retries):
         try:
             if attempt > 0:
-                time.sleep(attempt * 3 + random.uniform(1, 3))
-            session = build_session()
+                time.sleep(attempt * 2 + random.uniform(1, 2))
+
             pt = TrendReq(
-                hl="en-US", tz=0, timeout=(15, 40),
-                requests_args={"verify": True, "headers": session.headers},
-                retries=1, backoff_factor=1.0,
+                hl="en-US",
+                tz=0,
+                timeout=(15, 40),
+                proxies={"https": SCRAPER_PROXY},
+                retries=1,
+                backoff_factor=1.0,
             )
-            pt.build_payload(kw_list=keywords[:5], timeframe=timeframe, geo=geo, gprop="")
+            pt.build_payload(
+                kw_list=keywords[:5],
+                timeframe=timeframe,
+                geo=geo,
+                gprop="",
+            )
             df = pt.interest_over_time()
             if df is not None and not df.empty:
                 if "isPartial" in df.columns:
@@ -86,7 +83,11 @@ def safe_trends_request(keywords: list, timeframe: str, geo: str, retries: int =
         except Exception as e:
             last_error = str(e)
             continue
-    raise HTTPException(status_code=503, detail=f"Google Trends 요청 실패 ({retries}회 재시도): {last_error}")
+
+    raise HTTPException(
+        status_code=503,
+        detail=f"Google Trends 요청 실패 ({retries}회 재시도): {last_error}"
+    )
 
 def resample_df(df, granularity):
     if granularity == "monthly":
@@ -96,7 +97,10 @@ def resample_df(df, granularity):
     return df
 
 def df_to_labels(df, granularity):
-    return [idx.strftime("%Y-%m") if granularity != "yearly" else str(idx.year) for idx in df.index]
+    return [
+        idx.strftime("%Y-%m") if granularity != "yearly" else str(idx.year)
+        for idx in df.index
+    ]
 
 def safe_val(v):
     return 0 if math.isnan(v) else round(float(v), 1)
@@ -137,25 +141,32 @@ def get_trends(
 
     geo = get_geo(region, country if country else None)
     timeframe = f"{date_from} {date_to}"
-    time.sleep(random.uniform(0.5, 1.5))
+    time.sleep(random.uniform(0.3, 0.8))
 
     df = safe_trends_request(kw_list, timeframe, geo)
 
     if df is None or df.empty:
-        return {"labels":[],"datasets":[{"keyword":k,"data":[]} for k in kw_list],
-                "source":get_source_label(region),"geo":geo,
-                "region_label":get_region_label(region),"note":"데이터 없음"}
+        return {
+            "labels":[], "datasets":[{"keyword":k,"data":[]} for k in kw_list],
+            "source":get_source_label(region), "geo":geo,
+            "region_label":get_region_label(region), "note":"데이터 없음"
+        }
 
     df = resample_df(df, granularity)
     labels = df_to_labels(df, granularity)
     datasets = [
-        {"keyword":kw,"data":[safe_val(v) for v in df[kw].tolist()] if kw in df.columns else [0]*len(labels)}
+        {
+            "keyword": kw,
+            "data": [safe_val(v) for v in df[kw].tolist()] if kw in df.columns else [0]*len(labels)
+        }
         for kw in kw_list
     ]
 
-    return {"labels":labels,"datasets":datasets,
-            "source":get_source_label(region),"geo":geo,
-            "region_label":get_region_label(region)}
+    return {
+        "labels":labels, "datasets":datasets,
+        "source":get_source_label(region), "geo":geo,
+        "region_label":get_region_label(region)
+    }
 
 @app.get("/api/trends/compare")
 def compare_trends(
@@ -177,7 +188,7 @@ def compare_trends(
 
     for i in range(0, len(kw_list), 5):
         batch = kw_list[i:i+5]
-        time.sleep(random.uniform(2.0, 4.0))
+        time.sleep(random.uniform(1.0, 2.0))
         try:
             df = safe_trends_request(batch, timeframe, geo)
             if df is None or df.empty:
@@ -191,14 +202,19 @@ def compare_trends(
         except Exception:
             continue
 
-    datasets = [{"keyword":k,"data":all_datasets.get(k,[0]*len(all_labels))} for k in kw_list]
-    return {"labels":all_labels,"datasets":datasets,
-            "source":get_source_label(region),"geo":geo,
-            "region_label":get_region_label(region)}
+    datasets = [
+        {"keyword":k, "data":all_datasets.get(k, [0]*len(all_labels))}
+        for k in kw_list
+    ]
+    return {
+        "labels":all_labels, "datasets":datasets,
+        "source":get_source_label(region), "geo":geo,
+        "region_label":get_region_label(region)
+    }
 
 @app.get("/api/regions")
 def get_regions():
     return {"regions":[
-        {"id":k,"label":get_region_label(k),"source":get_source_label(k),"geo":v}
-        for k,v in REGION_GEO.items()
+        {"id":k, "label":get_region_label(k), "source":get_source_label(k), "geo":v}
+        for k, v in REGION_GEO.items()
     ]}
